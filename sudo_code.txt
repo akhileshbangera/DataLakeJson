@@ -1,0 +1,276 @@
+Pseudocode: ML Training Data Platform
+I. Setup & Configuration (Before Running Workflow)
+AWS S3 Buckets & Prefixes:
+
+your-ml-data-lake-bucket (main bucket)
+
+raw-json-data/all_historical_files/ (Initial 9TB dump)
+
+raw-json-data/YYYY/weekXX/ (Incremental weekly syncs)
+
+raw-json-data-processed/ (Processed raw JSONs for archival)
+
+curated-data-lake/json_parsed_parquet/ (Output Parquet for ML)
+
+error-data-lake/json_malformed_records/ (Dead Letter Queue for corrupt records)
+
+glue-scripts/ (Location for Glue Job scripts)
+
+Amazon RDS PostgreSQL Database:
+
+Instance: your-ml-data-db-instance
+
+Database: data_platform_db
+
+Table: file_processing_status
+
+file_id (PK, SERIAL)
+
+s3_key (VARCHAR, UNIQUE, NOT NULL)
+
+file_size_bytes (BIGINT)
+
+last_modified_timestamp (TIMESTAMP WITH TIME ZONE)
+
+processing_status (VARCHAR - PENDING, PROCESSING, SUCCEEDED, FAILED, QUARANTINED)
+
+glue_job_run_id (VARCHAR)
+
+processed_at (TIMESTAMP WITH TIME ZONE)
+
+error_message (TEXT)
+
+retry_count (INT)
+
+created_at (TIMESTAMP WITH TIME ZONE)
+
+updated_at (TIMESTAMP WITH TIME ZONE)
+
+Index: idx_processing_status on processing_status
+
+AWS IAM Roles & Permissions:
+
+Glue Jobs IAM Role: Permissions for S3 (R/W on all relevant prefixes), RDS (Connect), CloudWatch (Logs), Glue (API calls to start/monitor jobs).
+
+S3 Lifecycle Policy:
+
+Applied to: s3://your-ml-data-lake-bucket/raw-json-data-processed/
+
+Action: Transition objects to S3 Intelligent-Tiering (or Glacier Instant Retrieval after 60-90 days if preferred).
+
+II. AWS Glue Workflow: JsonToParquetProcessingWorkflow
+This workflow orchestrates the entire backfill and incremental processing.
+
+A. Glue Job: FileListerAndDbPopulator (PySpark / Python Shell)
+Trigger: Manual (for initial 9TB backfill) or Scheduled (periodically, e.g., daily/weekly to discover new YYYY/weekXX folders).
+
+Purpose: Discover raw JSON files in S3 and register them in the RDS tracking table.
+
+Code snippet
+
+FUNCTION FileListerAndDbPopulator_Job:
+    # 1. Initialize AWS Clients & RDS Connection
+    S3_CLIENT = Boto3 S3 Client
+    RDS_CONNECTION = Connect to RDS_POSTGRESQL using JDBC_URL, USERNAME, PASSWORD
+    CURSOR = RDS_CONNECTION.cursor()
+    
+    # 2. List all JSON files in raw S3 prefixes
+    ALL_RAW_JSON_PATHS = []
+    For each PREFIX in [raw-json-data/all_historical_files/, raw-json-data/YYYY/weekXX/ (for relevant historical/incremental years/weeks)]:
+        PAGINATOR = S3_CLIENT.get_paginator('list_objects_v2')
+        For each PAGE in PAGINATOR.paginate(Bucket=YOUR_BUCKET, Prefix=PREFIX):
+            For each OBJECT in PAGE['Contents']:
+                If not OBJECT['Key'].endswith('/'): // Skip S3 "folders"
+                    ADD "s3://YOUR_BUCKET/" + OBJECT['Key'] to ALL_RAW_JSON_PATHS
+    
+    # 3. Insert new files into RDS with 'PENDING' status (on conflict, do nothing)
+    COUNT_NEW_FILES = 0
+    For each S3_KEY in ALL_RAW_JSON_PATHS:
+        TRY:
+            EXECUTE SQL "INSERT INTO file_processing_status (s3_key, processing_status, created_at, updated_at) VALUES (%s, 'PENDING', NOW(), NOW()) ON CONFLICT (s3_key) DO NOTHING;" with (S3_KEY)
+            If SQL_RESULT indicates a new row was inserted:
+                INCREMENT COUNT_NEW_FILES
+        CATCH UNIQUE_VIOLATION_ERROR:
+            // File already exists in DB, ignore
+        CATCH OTHER_DB_ERROR as E:
+            LOG_ERROR "Failed to insert S3_KEY into DB: " + S3_KEY + " Error: " + E
+            RAISE EXCEPTION // Propagate error for retry/alert
+    
+    COMMIT RDS_CONNECTION
+    LOG_INFO COUNT_NEW_FILES + " new files added to RDS for processing."
+    
+    CLOSE RDS_CONNECTION
+END FUNCTION
+B. Glue Trigger: BatchProcessorScheduler
+Type: Scheduled Trigger
+
+Configuration: Schedule: CRON_EXPRESSION (e.g., cron(0/15 * * * ? *) for every 15 minutes)
+
+Action: Starts the JsonToParquetBatchProcessor Glue Job.
+
+C. Glue Job: JsonToParquetBatchProcessor (PySpark ETL Job)
+Trigger: Activated by BatchProcessorScheduler
+
+Purpose: Selects a batch of files, processes them (JSON to Parquet), handles errors, updates RDS, and manages S3 file moves.
+
+Code snippet
+
+FUNCTION JsonToParquetBatchProcessor_Job:
+    # 1. Initialize AWS Clients & RDS Connection
+    SPARK_SESSION = Get Spark Session
+    S3_CLIENT = Boto3 S3 Client
+    GLUE_JOB_RUN_ID = Get current Glue Job Run ID
+    RDS_CONNECTION = Connect to RDS_POSTGRESQL
+    CURSOR = RDS_CONNECTION.cursor()
+    Set RDS_CONNECTION.autocommit = False // Enable explicit transactions
+
+    # 2. Select a Batch of Files from RDS and Mark as 'PROCESSING'
+    BATCH_SIZE = Get BATCH_SIZE_FILES parameter (e.g., 10000)
+    SELECTED_S3_KEYS = []
+    
+    TRY:
+        EXECUTE SQL "SELECT s3_key FROM file_processing_status WHERE processing_status IN ('PENDING', 'FAILED') ORDER BY created_at LIMIT %s FOR UPDATE SKIP LOCKED;" with (BATCH_SIZE)
+        For each ROW in SQL_RESULT:
+            ADD ROW['s3_key'] to SELECTED_S3_KEYS
+        
+        If SELECTED_S3_KEYS is empty:
+            LOG_INFO "No PENDING or FAILED files found. Exiting gracefully."
+            CLOSE RDS_CONNECTION
+            RETURN // No work to do, job ends successfully
+        
+        EXECUTE SQL "UPDATE file_processing_status SET processing_status = 'PROCESSING', updated_at = NOW(), retry_count = retry_count + 1 WHERE s3_key IN (%s);" with (SELECTED_S3_KEYS)
+        COMMIT RDS_CONNECTION
+        LOG_INFO "Selected " + len(SELECTED_S3_KEYS) + " files for processing and marked as 'PROCESSING'."
+    CATCH EXCEPTION as E:
+        LOG_ERROR "Error during batch selection/status update: " + E
+        ROLLBACK RDS_CONNECTION
+        RAISE EXCEPTION // Fail job to trigger retry/alert
+    
+    # 3. Process Batch: Read JSON, Transform, Write Parquet
+    GOOD_RECORDS_S3_KEYS = [] // To track files that successfully convert to Parquet
+    CORRUPT_RECORDS_S3_KEYS = [] // To track files that caused corrupt records
+
+    TRY:
+        // Read JSON with PERMISSIVE mode, adding source_s3_path
+        RAW_DF = SPARK_SESSION.read.option("mode", "PERMISSIVE") \
+                               .option("columnNameOfCorruptRecord", "_corrupt_record") \
+                               .json(SELECTED_S3_KEYS) \
+                               .withColumn("source_s3_path", input_file_name())
+        
+        GOOD_RECORDS_DF = RAW_DF.filter(col("_corrupt_record").isNull()).drop("_corrupt_record")
+        CORRUPT_RECORDS_DF = RAW_DF.filter(col("_corrupt_record").isNotNull())
+
+        // Handle Corrupt Records
+        If CORRUPT_RECORDS_DF.count() > 0:
+            CORRUPT_S3_KEYS_FROM_DF = CORRUPT_RECORDS_DF.select("source_s3_path").distinct().collect()
+            For each KEY in CORRUPT_S3_KEYS_FROM_DF:
+                ADD KEY to CORRUPT_RECORDS_S3_KEYS
+            
+            CORRUPT_RECORDS_DF.write.mode("append").json("s3://YOUR_BUCKET/error-data-lake/json_malformed_records/" + GLUE_JOB_RUN_ID + "/")
+            LOG_WARNING "Quarantined " + len(CORRUPT_RECORDS_S3_KEYS) + " corrupt files to DLQ."
+        
+        // Process Good Records
+        If GOOD_RECORDS_DF.count() > 0:
+            // Apply transformations (flattening, type casting for DATE/MODE etc.)
+            // Ensure 'source_s3_path' column is carried through transformations
+            PROCESSED_DF = Apply_Transformations(GOOD_RECORDS_DF) 
+            
+            // Write to Parquet
+            PROCESSED_DF.write.mode("append") \
+                        .partitionBy("year", "month", "day", "mode") \
+                        .option("mergeSchema", "True") \
+                        .parquet("s3://YOUR_BUCKET/curated-data-lake/json_parsed_parquet/")
+            
+            GOOD_RECORDS_S3_KEYS = PROCESSED_DF.select("source_s3_path").distinct().collect()
+            LOG_INFO "Successfully wrote Parquet for " + len(GOOD_RECORDS_S3_KEYS) + " files."
+        Else:
+            LOG_WARNING "No good records found to process in this batch."
+
+    CATCH EXCEPTION as E:
+        LOG_ERROR "Critical processing error for batch: " + E
+        // Attempt to mark all SELECTED_S3_KEYS as FAILED due to job-level error
+        EXECUTE SQL "UPDATE file_processing_status SET processing_status = 'FAILED', error_message = %s, updated_at = NOW() WHERE s3_key IN (%s);" with (E.message, SELECTED_S3_KEYS)
+        COMMIT RDS_CONNECTION
+        RAISE EXCEPTION // Re-raise to fail Glue Job
+    
+    # 4. S3 File Management: Move Raw JSONs & Update RDS for SUCCEEDED/FAILED
+    For each S3_KEY_FULL_PATH in SELECTED_S3_KEYS:
+        SOURCE_BUCKET = Extract bucket from S3_KEY_FULL_PATH
+        SOURCE_KEY = Extract key from S3_KEY_FULL_PATH
+        DESTINATION_KEY = Replace "raw-json-data/" with "raw-json-data-processed/" in SOURCE_KEY
+
+        CURRENT_STATUS = 'FAILED'
+        ERROR_MSG = 'Processing failed for unknown reason' // Default error
+
+        If S3_KEY_FULL_PATH is in GOOD_RECORDS_S3_KEYS:
+            TRY:
+                S3_CLIENT.copy_object(Bucket=SOURCE_BUCKET, CopySource={'Bucket': SOURCE_BUCKET, 'Key': SOURCE_KEY}, Key=DESTINATION_KEY)
+                S3_CLIENT.delete_object(Bucket=SOURCE_BUCKET, Key=SOURCE_KEY)
+                LOG_INFO "Moved " + SOURCE_KEY + " to processed folder."
+                CURRENT_STATUS = 'SUCCEEDED'
+                ERROR_MSG = NULL
+            CATCH EXCEPTION as E_MOVE:
+                LOG_ERROR "Error moving/deleting S3 key " + S3_KEY_FULL_PATH + ": " + E_MOVE
+                ERROR_MSG = "S3 move failed: " + E_MOVE.message
+                CURRENT_STATUS = 'FAILED' // File could not be moved, mark as failed for re-attempt
+        Else If S3_KEY_FULL_PATH in CORRUPT_RECORDS_S3_KEYS:
+            CURRENT_STATUS = 'FAILED' // Already updated, just for clarity
+            ERROR_MSG = 'Malformed JSON or record level processing error. See DLQ for details.'
+        Else:
+            // This case implies a file was selected but didn't end up in good or corrupt records.
+            // Could be a very rare edge case or logic error.
+            LOG_WARNING "File " + S3_KEY_FULL_PATH + " selected but not processed."
+            CURRENT_STATUS = 'FAILED'
+            ERROR_MSG = 'File was in batch but not fully processed or moved.'
+
+        // Update RDS for this specific file
+        TRY:
+            EXECUTE SQL "UPDATE file_processing_status SET processing_status = %s, processed_at = NOW(), glue_job_run_id = %s, error_message = %s, updated_at = NOW() WHERE s3_key = %s;" with (CURRENT_STATUS, GLUE_JOB_RUN_ID, ERROR_MSG, S3_KEY_FULL_PATH)
+            COMMIT RDS_CONNECTION // Commit after each file update for granularity
+        CATCH EXCEPTION as E_DB_UPDATE:
+            LOG_ERROR "Failed to update RDS status for " + S3_KEY_FULL_PATH + ": " + E_DB_UPDATE
+            // This is a critical error for tracking, consider alerts.
+    
+    LOG_INFO "Batch processing completed for Glue Job Run ID: " + GLUE_JOB_RUN_ID
+    
+    CLOSE RDS_CONNECTION
+    SPARK_SESSION.stop()
+END FUNCTION
+
+FUNCTION Apply_Transformations(dataframe_input):
+    // Your actual PySpark transformation logic goes here
+    // Example:
+    TRANSFORMED_DF = dataframe_input.select(
+        col("id"),
+        col("DATE").cast(DateType()).alias("event_date"), // Example of casting
+        col("MODE").alias("event_mode"),
+        // Flattening of nested structures
+        col("some_nested_struct.field1").alias("nested_field1"),
+        col("some_list_of_structs").alias("original_complex_list"), // Keep complex structures as is if not fully flattening
+        col("source_s3_path") // Keep the source S3 path in the final Parquet
+    )
+    // Add columns for year, month, day for partitioning (if not already derived)
+    TRANSFORMED_DF = TRANSFORMED_DF.withColumn("year", year(col("event_date"))) \
+                               .withColumn("month", month(col("event_date"))) \
+                               .withColumn("day", dayofmonth(col("event_date")))
+    RETURN TRANSFORMED_DF
+III. Monitoring & Alerting
+AWS CloudWatch:
+
+Logs: Monitor Glue Job logs for ERROR and WARNING messages (especially from JsonToParquetBatchProcessor related to corrupt records or move failures).
+
+Metrics: Monitor Glue job DPU utilization, runtime. Monitor RDS metrics (CPU, Memory, IOPS) to ensure the database can handle the load.
+
+Amazon SNS:
+
+Subscriptions: Email addresses for alerts.
+
+CloudWatch Alarms:
+
+Glue Job Failure: Alarm when JsonToParquetBatchProcessor state is FAILED.
+
+DLQ Activity: Alarm when new objects are written to s3://YOUR_BUCKET/error-data-lake/json_malformed_records/ (e.g., via S3 Event Notification to a Lambda that emits a custom metric, then alarm on metric).
+
+RDS Performance: Alarms for high CPU, low free memory, high disk queue depth on the RDS instance.
+
+Custom Alarms (Optional): If FileListerAndDbPopulator is scheduled, alarm if it consistently runs for too long or fails.
