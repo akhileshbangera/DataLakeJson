@@ -1,0 +1,90 @@
++------------------------------------+
+|            AWS S3 (Data Lake)      |
+|  s3://your-bucket/                 |
++------------------------------------+
+       |          |          |
+       |          |          | (Weekly sync)
+       |          |          |
+       |          |          v
++------------------------------------+
+| Raw Data (Landing Zones)           |
+|  - all_historical_files/ (9TB)     |  <-- Original JSON files
+|  - YYYY/weekXX/ (Weekly new data)  |
++------------------------------------+
+       |
+       | (Batch Processing Orchestration)
+       |   (Initial 9TB historical backfill)
+       |   (Weekly incremental loads)
+       |
+       v
++-------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+|                                                                    AWS Glue Workflow (Orchestrator)                                                                   |
+|                                                                                                                                                                   |
+|  +-----------------------------------------------------------------------------------+      +---------------------------------------------------------------------+ |
+|  |           Glue Job: "File Lister & RDS Populator" (Runs once initially)         |      |     Glue Job: "Batch Processor" (Your main ETL for JSON to Parquet) | |
+|  | (PySpark/Python Shell)                                                          |      |     (PySpark)                                                       | |
+|  | - Lists all S3 objects in raw data folders                                      |      |     - Connects to RDS PostgreSQL                                    | |
+|  | - Populates `file_processing_status` table in RDS with 'PENDING' entries        |----->|     - Selects N 'PENDING'/'FAILED' files, marks 'PROCESSING' (txn)  | |
+|  +-----------------------------------------------------------------------------------+      |     - Reads JSON files (from `input_s3_paths` arg)                  | |
+|  |                                                                                   |      |     - Infer/flatten schema, convert to Parquet                      | |
+|  |                                                                                   |      |     - Writes partitioned Parquet to `curated-data-lake/`            | |
+|  |      +---------------------------------------------------------------------+      |      |     - **MOVES ORIGINAL RAW JSON** to `raw-json-data-processed/`     | |
+|  |      |            Glue Trigger (Scheduled, e.g., every 5 min)            |------|----->|     - Updates `file_processing_status` to 'SUCCEEDED'/'FAILED'      | |
+|  |      +---------------------------------------------------------------------+      |      |                                                                     | |
+|  +-----------------------------------------------------------------------------------+      +---------------------------------------------------------------------+ |
++-------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+       |                                                    ^
+       |                                                    | (Updates status in RDS on success/failure)
+       |                                                    |
+       v                                                    |
++------------------------------------+                      |
+| RDS PostgreSQL (Tracking Metadata) |                      |
+|  `file_processing_status` table    |----------------------+
+|  - `s3_key` (raw JSON file path)   |
+|  - `processing_status`             |
+|  - `glue_job_run_id`               |
+|  - `processed_at`, `error_message` |
++------------------------------------+
+       |
+       | (Processed Raw JSON files)
+       v
++------------------------------------+
+| AWS S3 (Data Lake)                 |
+|  s3://your-bucket/                 |
+|                                    |
+|  +--------------------------------+
+|  | Processed Raw Data             |
+|  |  - raw-json-data-processed/    | <-- Original JSON files after ETL (for audit/reprocessing)
+|  +--------------------------------+
+|           |
+|           | (S3 Lifecycle Policy: Intelligent-Tiering after 2-3 months)
+|           v
+|  +--------------------------------+
+|  | S3 Intelligent-Tiering         |
+|  |  (Automatic movement to lower  |
+|  |   cost tiers based on access)  |
+|  +--------------------------------+
++------------------------------------+
+       |
+       | (Transformed Parquet Data)
+       v
++------------------------------------+
+| AWS S3 (Data Lake)                 |
+|  s3://your-bucket/                 |
+|                                    |
+|  +--------------------------------+
+|  | Curated Data (ML Training)     |
+|  |  - json_parsed_parquet/        | <-- Optimized, partitioned Parquet for ML
+|  |    - year=YYYY/month=MM/day=DD/|
+|  |    - mode=XYZ/                 |
+|  +--------------------------------+
++------------------------------------+
+       |
+       | (Query & Access for ML)
+       v
++------------------------------------+
+|             Analytics/ML Layer     |
+|  - Amazon Athena                   | <-- SQL queries for data selection
+|  - Apache Spark (EMR/Glue Context) | <-- Programmatic access, Feature Engineering
+|  - ML Training Application         | <-- Consumes selected Parquet data
++------------------------------------+
