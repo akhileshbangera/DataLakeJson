@@ -1,0 +1,123 @@
++---------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+|                                                                                 AWS Cloud Boundary                                                                            |
+|                                                                                                                                                                           |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  | S3 Bucket: `your-ml-data-lake-bucket`                                                                                                                                 |  |
+|  |                                                                                                                                                                       |  |
+|  |   +---------------------------------------+    (Weekly Sync)       +------------------------------------------+                                                     |  |
+|  |   | S3 Prefix: `raw-json-data/`           |--------------------->| S3 Prefix: `raw-json-data/YYYY/weekXX/`  |                                                     |  |
+|  |   |  - `all_historical_files/` (9TB)      |                        |  - New weekly JSON files                 |                                                     |  |
+|  |   |  (Original Nested JSON Files)         |                        |                                          |                                                     |  |
+|  |   +---------------------------------------+                        +------------------------------------------+                                                     |  |
+|  |                                                                                                                                                                       |  |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|       |                                                                                                                                                                   |
+|       | 1. INITIAL FILE LISTING / DB POPULATION                                                                                                                           |
+|       |    (One-time or periodic trigger to discover all raw JSONs and record them in RDS)                                                                                |
+|       v                                                                                                                                                                   |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  | AWS Glue Workflow: `JsonToParquetProcessingWorkflow` (Orchestration)                                                                                                |  |
+|  |                                                                                                                                                                       |  |
+|  |   +---------------------------------------+                                                                                                                         |  |
+|  |   | Glue Job: `FileListerAndDbPopulator`  |                                                                                                                         |  |
+|  |   | (PySpark/Python Shell)                |                                                                                                                         |  |
+|  |   | - Lists ALL S3 objects in `raw-json-data/`                                                                                                                        |  |
+|  |   | - Populates `file_processing_status` in RDS (Initial 'PENDING' status for each file)                                                                              |  |
+|  |   +---------------------------------------+                                                                                                                         |  |
+|  |       |                                                                                                                                                               |  |
+|  |       v                                                                                                                                                               |  |
+|  |   +---------------------------------------+                                                                                                                         |  |
+|  |   | Glue Trigger: `BatchProcessorScheduler` |                                                                                                                         |  |
+|  |   | (Scheduled: e.g., every 5-15 minutes) |                                                                                                                         |  |
+|  |   +---------------------------------------+                                                                                                                         |  |
+|  |       |                                                                                                                                                               |  |
+|  |       | 2. BATCH PROCESSING LOOP (Triggered repeatedly by scheduler)                                                                                                    |  |
+|  |       v                                                                                                                                                               |  |
+|  |   +-----------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  |   | Glue Job: `JsonToParquetBatchProcessor` (Main ETL Job)                                                                                                          |  |
+|  |   | (PySpark ETL Job)                                                                                                                                               |  |
+|  |   | - IAM Role with S3 R/W, RDS Connect, Glue Permissions                                                                                                           |  |
+|  |   | - Connects to RDS PostgreSQL:                                                                                                                                   |  |
+|  |   |   - Selects N `PENDING`/`FAILED` files from `file_processing_status`                                                                                              |  |
+|  |   |   - **Updates status to `PROCESSING` (Atomic Transaction via `FOR UPDATE SKIP LOCKED`)** |  |
+|  |   | - Reads selected JSON files from `raw-json-data/` prefixes in S3                                                                                                  |  |
+|  |   | - Processes JSON: Schema Inference, Selective Flattening (DATE, MODE), Handle Schema Evolution (`mergeSchema=True`)                                             |  |
+|  |   | - Writes transformed data to S3: `curated-data-lake/json_parsed_parquet/year=YYYY/month=MM/day=DD/mode=XYZ/...` (Partitioned Parquet)                             |  |
+|  |   | - **S3 File Management (within Glue Job):** |  |
+|  |   |   - Copies processed raw JSON files from `raw-json-data/` to `raw-json-data-processed/`                                                                           |  |
+|  |   |   - Deletes original raw JSON files from `raw-json-data/`                                                                                                         |  |
+|  |   | - Updates RDS PostgreSQL:                                                                                                                                       |  |
+|  |   |   - Updates status of processed files to `SUCCEEDED` (or `FAILED` if internal error)                                                                              |  |
+|  |   |   - Records `glue_job_run_id`, `processed_at`, `error_message`                                                                                                  |  |
+|  |   | - Exits gracefully if no `PENDING`/`FAILED` files found (indicating backfill completion)                                                                          |  |
+|  |   +-----------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|       |                                                                                                                                                                   |
+|       |                                                                                                                                                                   |
+|       v                                                                                                                                                                   |
+|  +---------------------------------------+                                                                                                                            |  |
+|  | Amazon RDS PostgreSQL (Database)      |<----------------------------------------------------------------------------------------------------------------------------+  |
+|  |  - Instance Type (e.g., db.t3.medium) |                                                                                                                             |  |
+|  |  - Database: `data_platform_db`       |                                                                                                                             |  |
+|  |  - Table: `file_processing_status`    | (Stores S3_key, status, job_id, timestamps, errors, retry_count)                                                              |  |
+|  |  (Tracking for historical/incremental processing)                                                                                                                     |  |
+|  +---------------------------------------+                                                                                                                            |  |
+|                                                                                                                                                                           |  |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  | S3 Bucket: `your-ml-data-lake-bucket` (Continued)                                                                                                                     |  |
+|  |                                                                                                                                                                       |  |
+|  |   +---------------------------------------+                                                                                                                         |  |
+|  |   | S3 Prefix: `raw-json-data-processed/` |                                                                                                                         |  |
+|  |   |  - (Copies of Raw JSON after ETL)     |                                                                                                                         |  |
+|  |   +---------------------------------------+                                                                                                                         |  |
+|  |       |                                                                                                                                                               |  |
+|  |       | 3. S3 LIFECYCLE MANAGEMENT                                                                                                                                      |  |
+|  |       |    (Automatic transition based on age)                                                                                                                        |  |
+|  |       v                                                                                                                                                               |  |
+|  |   +---------------------------------------+                                                                                                                         |  |
+|  |   | S3 Intelligent-Tiering                |                                                                                                                         |  |
+|  |   |  (Cost optimization for processed raw JSON)                                                                                                                     |  |
+|  |   |  - Automatically moves to FA, IA, Archive Instant Access tiers                                                                                                    |  |
+|  |   |  - Optional: Opt-in for Glacier Flexible Retrieval / Deep Archive (after 180/270 days)                                                                           |  |
+|  |   +---------------------------------------+                                                                                                                         |  |
+|  |                                                                                                                                                                       |  |
+|  |   +---------------------------------------+                                                                                                                         |  |
+|  |   | S3 Prefix: `curated-data-lake/`       |                                                                                                                         |  |
+|  |   |  - `json_parsed_parquet/`             |                                                                                                                         |  |
+|  |   |    - `year=YYYY/month=MM/day=DD/`     |                                                                                                                         |  |
+|  |   |    - `mode=XYZ/...`                   | (Optimized, Partitioned Parquet for ML Training)                                                                        |  |
+|  |   +---------------------------------------+                                                                                                                         |  |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|       |                                                                                                                                                                   |
+|       | 4. DATA CONSUMPTION FOR ML TRAINING                                                                                                                               |  |
+|       v                                                                                                                                                                   |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  | AWS Analytics & ML Services                                                                                                                                           |  |
+|  |                                                                                                                                                                       |  |
+|  |   +---------------------------------------+      +---------------------------------------+      +---------------------------------------+                          |  |
+|  |   | Amazon Athena (Query Engine)          |----->| AWS Glue Data Catalog                 |----->| ML Training Applications              |                          |  |
+|  |   |  - Ad-hoc SQL queries                 |      |  (Schema for Parquet data)            |      |  (e.g., Amazon SageMaker, EC2 instances) |                          |  |
+|  |   |  - Data selection for ML              |      |                                       |      |  - Uses DATE/MODE filters for subsets |                          |  |
+|  |   +---------------------------------------+      +---------------------------------------+      |  - Requires full/subset data          |                          |  |
+|  |                                                                                                 |  - Periodic retraining on new data    |                          |  |
+|  |   +---------------------------------------+                                                     +---------------------------------------+                          |  |
+|  |   | Apache Spark (via AWS EMR/Glue Dev Endpoints/Interactive Sessions)                           |                                                                   |  |
+|  |   |  - Complex feature engineering        |                                                                                                                         |  |
+|  |   |  - Direct DataFrame manipulation      |                                                                                                                         |  |
+|  |   +---------------------------------------+                                                                                                                         |  |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|                                                                                                                                                                           |  |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  | AWS CloudWatch (Monitoring & Logging)                                                                                                                                 |  |
+|  |  - Logs from Glue Jobs (for debugging)                                                                                                                                |  |
+|  |  - Metrics for Glue Jobs (DPU usage, runtime)                                                                                                                         |  |
+|  |  - Alarms on Glue Job failures, RDS metrics (for alerts via SNS)                                                                                                      |  |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|                                                                                                                                                                           |  |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  | AWS Identity and Access Management (IAM)                                                                                                                              |  |
+|  |  - Roles for Glue Jobs (permissions for S3, RDS, CloudWatch, Glue API calls)                                                                                          |  |
+|  |  - Policies for S3 bucket access                                                                                                                                      |  |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|                                                                                                                                                                           |  |
++---------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
