@@ -2,9 +2,9 @@
 title: ML Training Data Platform on AWS
 ---
 graph TD
-    %% Diagram Direction
+    %% Diagram Direction for the main graph
     
-    %% S3 Buckets and Prefixes
+    %% S3 Data Lake Subgraph
     subgraph "S3 Data Lake (your-ml-data-lake-bucket)"
         direction TD
         S3_RAW["S3: raw-json-data/<br/>(9TB JSON)"]
@@ -19,7 +19,7 @@ graph TD
     %% RDS PostgreSQL for Tracking
     RDS_DB[(RDS PostgreSQL<br/>file_processing_status)]
 
-    %% AWS Glue Workflow and Jobs
+    %% AWS Glue Workflow and Jobs Subgraph
     subgraph "AWS Glue Workflow (JsonToParquetProcessingWorkflow)"
         direction TD
         GLUE_LISTER_JOB[("Glue Job: FileListerAndDbPopulator<br/>(PySpark/Python Shell)")]
@@ -52,7 +52,7 @@ graph TD
 
     GLUE_PROCESSOR_JOB -- "Updates Schema" --> GLUE_DATACATALOG
 
-    %% Analytics and ML Consumption
+    %% Analytics and ML Consumption Subgraph
     subgraph "Analytics & ML Consumption"
         direction TD
         ATHENA["Amazon Athena<br/>(SQL Queries)"]
@@ -68,7 +68,7 @@ graph TD
         ML_TRAINING_APP -- "Connects to S3/Spark" --> GLUE_DATACATALOG
     end
 
-    %% Monitoring and Security
+    %% Monitoring and Security Subgraph
     subgraph "Management & Monitoring"
         direction LR
         CLOUDWATCH["Amazon CloudWatch<br/>(Logs, Metrics, Alarms)"]
