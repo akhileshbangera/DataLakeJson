@@ -5,7 +5,7 @@ graph TD
     %% Diagram Direction
     
     %% S3 Buckets and Prefixes
-    subgraph S3 Data Lake (your-ml-data-lake-bucket)
+    subgraph "S3 Data Lake (your-ml-data-lake-bucket)"
         direction TD
         S3_RAW["S3: raw-json-data/<br/>(9TB JSON)"]
         S3_WEEKLY["S3: raw-json-data/YYYY/weekXX/<br/>(New Weekly JSON)"]
@@ -20,7 +20,7 @@ graph TD
     RDS_DB[(RDS PostgreSQL<br/>file_processing_status)]
 
     %% AWS Glue Workflow and Jobs
-    subgraph AWS Glue Workflow (JsonToParquetProcessingWorkflow)
+    subgraph "AWS Glue Workflow (JsonToParquetProcessingWorkflow)"
         direction TD
         GLUE_LISTER_JOB[("Glue Job: FileListerAndDbPopulator<br/>(PySpark/Python Shell)")]
         GLUE_SCHEDULER_TRIGGER{{"Glue Trigger: BatchProcessorScheduler<br/>(Every 15 min)"}}
@@ -53,7 +53,7 @@ graph TD
     GLUE_PROCESSOR_JOB -- "Updates Schema" --> GLUE_DATACATALOG
 
     %% Analytics and ML Consumption
-    subgraph Analytics & ML Consumption
+    subgraph "Analytics & ML Consumption"
         direction TD
         ATHENA["Amazon Athena<br/>(SQL Queries)"]
         SPARK_EMR_GLUE["Apache Spark<br/>(EMR/Glue Interactive Sessions)"]
@@ -69,7 +69,7 @@ graph TD
     end
 
     %% Monitoring and Security
-    subgraph Management & Monitoring
+    subgraph "Management & Monitoring"
         direction LR
         CLOUDWATCH["Amazon CloudWatch<br/>(Logs, Metrics, Alarms)"]
         SNS[("Amazon SNS<br/>(Notifications)")]
