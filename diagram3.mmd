@@ -1,96 +1,93 @@
+---
+title: ML Training Data Platform on AWS
+---
 graph TD
-    %% Diagram Title and Direction
-    title: ML Training Data Platform on AWS
+    %% Diagram Direction
     
-    %% AWS Cloud Boundary (represented as a subgraph)
-    subgraph AWS Cloud
-        direction LR
+    %% S3 Buckets and Prefixes
+    subgraph S3 Data Lake (your-ml-data-lake-bucket)
+        direction TD
+        S3_RAW["S3: raw-json-data/<br/>(9TB JSON)"]
+        S3_WEEKLY["S3: raw-json-data/YYYY/weekXX/<br/>(New Weekly JSON)"]
+        S3_PROCESSED_RAW["S3: raw-json-data-processed/<br/>(Processed Raw JSONs)"]
+        S3_CURATED_PARQUET["S3: curated-data-lake/json_parsed_parquet/<br/>(Curated Parquet for ML)"]
+        S3_ERROR_DLQ["S3: error-data-lake/json_malformed_records/<br/>(Corrupt JSON DLQ)"]
 
-        %% S3 Buckets and Prefixes
-        subgraph S3 Data Lake (your-ml-data-lake-bucket)
-            direction TD
-            S3_RAW["S3: raw-json-data/<br/>(9TB JSON)"]
-            S3_WEEKLY["S3: raw-json-data/YYYY/weekXX/<br/>(New Weekly JSON)"]
-            S3_PROCESSED_RAW["S3: raw-json-data-processed/<br/>(Processed Raw JSONs)"]
-            S3_CURATED_PARQUET["S3: curated-data-lake/json_parsed_parquet/<br/>(Curated Parquet for ML)"]
-            S3_ERROR_DLQ["S3: error-data-lake/json_malformed_records/<br/>(Corrupt JSON DLQ)"]
-
-            S3_RAW -->|Weekly Sync| S3_WEEKLY
-        end
-
-        %% RDS PostgreSQL for Tracking
-        RDS_DB[(RDS PostgreSQL<br/>file_processing_status)]
-
-        %% AWS Glue Workflow and Jobs
-        subgraph AWS Glue Workflow (JsonToParquetProcessingWorkflow)
-            direction TD
-            GLUE_LISTER_JOB[("Glue Job: FileListerAndDbPopulator<br/>(PySpark/Python Shell)")]
-            GLUE_SCHEDULER_TRIGGER{{"Glue Trigger: BatchProcessorScheduler<br/>(Every 15 min)"}}
-            GLUE_PROCESSOR_JOB[("Glue Job: JsonToParquetBatchProcessor<br/>(PySpark ETL Job)")]
-
-            GLUE_LISTER_JOB -- "1. Lists S3 files & Populates RDS" --> RDS_DB
-            GLUE_LISTER_JOB -- "Sets up Initial Status" --> GLUE_PROCESSOR_JOB
-
-            GLUE_SCHEDULER_TRIGGER -- "2. Triggers Periodically" --> GLUE_PROCESSOR_JOB
-        end
-
-        %% Connections between S3, RDS, and Glue
-        S3_RAW -- "Reads JSON files" --> GLUE_PROCESSOR_JOB
-        S3_WEEKLY -- "Reads JSON files" --> GLUE_PROCESSOR_JOB
-
-        GLUE_PROCESSOR_JOB -- "Reads/Updates Status" --> RDS_DB
-        RDS_DB -- "Selects Next Batch" --> GLUE_PROCESSOR_JOB
-
-        GLUE_PROCESSOR_JOB -- "Writes Parquet" --> S3_CURATED_PARQUET
-        GLUE_PROCESSOR_JOB -- "Quarantines Corrupt Records" --> S3_ERROR_DLQ
-        GLUE_PROCESSOR_JOB -- "Copies Processed JSON" --> S3_PROCESSED_RAW
-        GLUE_PROCESSOR_JOB -- "Deletes Original JSON" --> S3_RAW
-
-        %% S3 Lifecycle Policy for Processed Raw Data
-        S3_PROCESSED_RAW -- "S3 Lifecycle Policy<br/>(Intelligent-Tiering after 2-3 months)" --> S3_INTELLIGENT_TIERING((S3 Intelligent-Tiering))
-
-        %% Glue Data Catalog
-        GLUE_DATACATALOG{{"AWS Glue Data Catalog"}}
-
-        GLUE_PROCESSOR_JOB -- "Updates Schema" --> GLUE_DATACATALOG
-
-        %% Analytics and ML Consumption
-        subgraph Analytics & ML Consumption
-            direction TD
-            ATHENA["Amazon Athena<br/>(SQL Queries)"]
-            SPARK_EMR_GLUE["Apache Spark<br/>(EMR/Glue Interactive Sessions)"]
-            ML_TRAINING_APP[["ML Training Applications<br/>(SageMaker, EC2, etc.)"]]
-
-            S3_CURATED_PARQUET -- "Reads Parquet" --> ATHENA
-            S3_CURATED_PARQUET -- "Reads Parquet" --> SPARK_EMR_GLUE
-            S3_CURATED_PARQUET -- "Reads Parquet" --> ML_TRAINING_APP
-
-            ATHENA -- "Queries" --> GLUE_DATACATALOG
-            SPARK_EMR_GLUE -- "Accesses Schema" --> GLUE_DATACATALOG
-            ML_TRAINING_APP -- "Connects to S3/Spark" --> GLUE_DATACATALOG
-        end
-
-        %% Monitoring and Security
-        subgraph Management & Monitoring
-            direction LR
-            CLOUDWATCH["Amazon CloudWatch<br/>(Logs, Metrics, Alarms)"]
-            SNS[("Amazon SNS<br/>(Notifications)")]
-            IAM{{"AWS IAM<br/>(Roles & Permissions)"}}
-            
-            CLOUDWATCH --> SNS
-            SNS --> ALERT_DESTINATION([Email/Slack Alerts])
-            
-            GLUE_PROCESSOR_JOB -- "Emits Logs/Metrics" --> CLOUDWATCH
-            GLUE_LISTER_JOB -- "Emits Logs/Metrics" --> CLOUDWATCH
-            RDS_DB -- "Emits Metrics" --> CLOUDWATCH
-            S3_RAW -- "Can Send Events" --> CLOUDWATCH
-            S3_WEEKLY -- "Can Send Events" --> CLOUDWATCH
-        end
-
-        IAM -- "Authorizes Access" --- GLUE_LISTER_JOB
-        IAM -- "Authorizes Access" --- GLUE_PROCESSOR_JOB
-        IAM -- "Authorizes Access" --- ATHENA
-        IAM -- "Authorizes Access" --- SPARK_EMR_GLUE
-        IAM -- "Authorizes Access" --- ML_TRAINING_APP
-        IAM -- "Authorizes Access" --- RDS_DB
+        S3_RAW -->|Weekly Sync| S3_WEEKLY
     end
+
+    %% RDS PostgreSQL for Tracking
+    RDS_DB[(RDS PostgreSQL<br/>file_processing_status)]
+
+    %% AWS Glue Workflow and Jobs
+    subgraph AWS Glue Workflow (JsonToParquetProcessingWorkflow)
+        direction TD
+        GLUE_LISTER_JOB[("Glue Job: FileListerAndDbPopulator<br/>(PySpark/Python Shell)")]
+        GLUE_SCHEDULER_TRIGGER{{"Glue Trigger: BatchProcessorScheduler<br/>(Every 15 min)"}}
+        GLUE_PROCESSOR_JOB[("Glue Job: JsonToParquetBatchProcessor<br/>(PySpark ETL Job)")]
+
+        GLUE_LISTER_JOB -- "1. Lists S3 files & Populates RDS" --> RDS_DB
+        GLUE_LISTER_JOB -- "Sets up Initial Status" --> GLUE_PROCESSOR_JOB
+
+        GLUE_SCHEDULER_TRIGGER -- "2. Triggers Periodically" --> GLUE_PROCESSOR_JOB
+    end
+
+    %% Connections between S3, RDS, and Glue
+    S3_RAW -- "Reads JSON files" --> GLUE_PROCESSOR_JOB
+    S3_WEEKLY -- "Reads JSON files" --> GLUE_PROCESSOR_JOB
+
+    GLUE_PROCESSOR_JOB -- "Reads/Updates Status" --> RDS_DB
+    RDS_DB -- "Selects Next Batch" --> GLUE_PROCESSOR_JOB
+
+    GLUE_PROCESSOR_JOB -- "Writes Parquet" --> S3_CURATED_PARQUET
+    GLUE_PROCESSOR_JOB -- "Quarantines Corrupt Records" --> S3_ERROR_DLQ
+    GLUE_PROCESSOR_JOB -- "Copies Processed JSON" --> S3_PROCESSED_RAW
+    GLUE_PROCESSOR_JOB -- "Deletes Original JSON" --> S3_RAW
+
+    %% S3 Lifecycle Policy for Processed Raw Data
+    S3_PROCESSED_RAW -- "S3 Lifecycle Policy<br/>(Intelligent-Tiering after 2-3 months)" --> S3_INTELLIGENT_TIERING((S3 Intelligent-Tiering))
+
+    %% Glue Data Catalog
+    GLUE_DATACATALOG{{"AWS Glue Data Catalog"}}
+
+    GLUE_PROCESSOR_JOB -- "Updates Schema" --> GLUE_DATACATALOG
+
+    %% Analytics and ML Consumption
+    subgraph Analytics & ML Consumption
+        direction TD
+        ATHENA["Amazon Athena<br/>(SQL Queries)"]
+        SPARK_EMR_GLUE["Apache Spark<br/>(EMR/Glue Interactive Sessions)"]
+        ML_TRAINING_APP[["ML Training Applications<br/>(SageMaker, EC2, etc.)"]]
+
+        S3_CURATED_PARQUET -- "Reads Parquet" --> ATHENA
+        S3_CURATED_PARQUET -- "Reads Parquet" --> SPARK_EMR_GLUE
+        S3_CURATED_PARQUET -- "Reads Parquet" --> ML_TRAINING_APP
+
+        ATHENA -- "Queries" --> GLUE_DATACATALOG
+        SPARK_EMR_GLUE -- "Accesses Schema" --> GLUE_DATACATALOG
+        ML_TRAINING_APP -- "Connects to S3/Spark" --> GLUE_DATACATALOG
+    end
+
+    %% Monitoring and Security
+    subgraph Management & Monitoring
+        direction LR
+        CLOUDWATCH["Amazon CloudWatch<br/>(Logs, Metrics, Alarms)"]
+        SNS[("Amazon SNS<br/>(Notifications)")]
+        IAM{{"AWS IAM<br/>(Roles & Permissions)"}}
+        
+        CLOUDWATCH --> SNS
+        SNS --> ALERT_DESTINATION([Email/Slack Alerts])
+        
+        GLUE_PROCESSOR_JOB -- "Emits Logs/Metrics" --> CLOUDWATCH
+        GLUE_LISTER_JOB -- "Emits Logs/Metrics" --> CLOUDWATCH
+        RDS_DB -- "Emits Metrics" --> CLOUDWATCH
+        S3_RAW -- "Can Send Events" --> CLOUDWATCH
+        S3_WEEKLY -- "Can Send Events" --> CLOUDWATCH
+    end
+
+    IAM -- "Authorizes Access" --- GLUE_LISTER_JOB
+    IAM -- "Authorizes Access" --- GLUE_PROCESSOR_JOB
+    IAM -- "Authorizes Access" --- ATHENA
+    IAM -- "Authorizes Access" --- SPARK_EMR_GLUE
+    IAM -- "Authorizes Access" --- ML_TRAINING_APP
+    IAM -- "Authorizes Access" --- RDS_DB
