@@ -1,0 +1,163 @@
++-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+|                                                                                                  AWS Cloud Boundary                                                                                   |
+|                                                                                                                                                                                                   |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  |   Amazon S3 (Simple Storage Service) - `your-ml-data-lake-bucket`                                                                                                                             |  |
+|  |                                                                                                                                                                                               |  |
+|  |   +---------------------------------------+    (Weekly SFTP/API/DataSync)       +------------------------------------------+                                                              |  |
+|  |   | S3 Prefix: `raw-json-data/`           |------------------------------------>| S3 Prefix: `raw-json-data/YYYY/weekXX/`  |                                                              |  |
+|  |   |  - `all_historical_files/` (9TB)      |                                      |  - New weekly JSON files (e.g., from Prod) |                                                              |  |
+|  |   |  (Original Immutable Nested JSON)     |                                      |                                          |                                                              |  |
+|  |   +---------------------------------------+                                      +------------------------------------------+                                                              |  |
+|  |                                                                                                                                                                                               |  |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|       |                                                                                                                                                                                             |
+|       | 1. INITIAL FILE DISCOVERY & DB POPULATION (For historical load & new folder discovery)                                                                                                    |
+|       |    (Triggered manually for backfill, or periodically for new `YYYY/weekXX` folders)                                                                                                       |
+|       v                                                                                                                                                                                             |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  |   AWS Glue Workflow: `JsonToParquetProcessingWorkflow` (Central Orchestration for Batched Processing)                                                                                       |  |
+|  |                                                                                                                                                                                               |  |
+|  |   +---------------------------------------+                                                                                                                                                 |  |
+|  |   | AWS Glue Job: `FileListerAndDbPopulator`|                                                                                                                                                 |  |
+|  |   | (Type: PySpark / Python Shell)        |                                                                                                                                                 |  |
+|  |   | - IAM Role: `GlueFileListerRole` (S3 Read, RDS Write)                                                                                                                                    |  |
+|  |   | - Task:                               |                                                                                                                                                 |  |
+|  |   |   1. Connects to RDS PostgreSQL.                                                                                                                                                          |  |
+|  |   |   2. Lists all S3 objects in `raw-json-data/` and `raw-json-data/YYYY/weekXX/` prefixes.                                                                                                 |  |
+|  |   |   3. For each file, inserts `s3_key`, `file_size_bytes`, `last_modified_timestamp` into `file_processing_status` in RDS with `processing_status = 'PENDING'` (`ON CONFLICT DO NOTHING`). |  |
+|  |   +---------------------------------------+                                                                                                                                                 |  |
+|  |       |                                                                                                                                                                                       |  |
+|  |       v                                                                                                                                                                                       |  |
+|  |   +---------------------------------------+                                                                                                                                                 |  |
+|  |   | AWS Glue Trigger: `BatchProcessorScheduler` |                                                                                                                                             |  |
+|  |   | (Type: Scheduled Trigger)             |                                                                                                                                                 |  |
+|  |   | - Schedule: `cron(0/15 * * * ? *)` (e.g., Every 15 minutes)                                                                                                                                |  |
+|  |   | - Event: On schedule, starts `JsonToParquetBatchProcessor` Glue Job.                                                                                                                      |  |
+|  |   +---------------------------------------+                                                                                                                                                 |  |
+|  |       |                                                                                                                                                                                       |  |
+|  |       v 2. BATCH PROCESSING LOOP (Triggered repeatedly by scheduler until all PENDING/FAILED files are processed)                                                                             |  |
+|  |   +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  |   | AWS Glue Job: `JsonToParquetBatchProcessor` (Core ETL & S3 File Management)                                                                                                           |  |
+|  |   | (Type: PySpark ETL Job)                                                                                                                                                                 |  |
+|  |   | - IAM Role: `GlueETLProcessorRole` (S3 R/W on all relevant prefixes, RDS Connect, CloudWatch, Glue API)                                                                                   |  |
+|  |   | - Parameters: `--input_s3_paths` (list of S3 keys from orchestrator), `--output_s3_path`, `--merge_schema_mode`, `--rds_jdbc_url`, `--rds_username`, `--rds_password`                 |  |
+|  |   | - **Tasks:** |  |
+|  |   |   1.  Connects to RDS PostgreSQL (`file_processing_status` table).                                                                                                                      |  |
+|  |   |   2.  **Batch Selection & Status Update (Transactional):** |  |
+|  |   |       - Queries RDS: `SELECT s3_key FROM file_processing_status WHERE processing_status IN ('PENDING', 'FAILED') ORDER BY created_at LIMIT <BATCH_SIZE> FOR UPDATE SKIP LOCKED;`        |  |
+|  |   |       - If no files found, logs "No work" and exits gracefully.                                                                                                                         |  |
+|  |   |       - Updates selected files in RDS: `SET processing_status = 'PROCESSING', retry_count = retry_count + 1;` (Commits transaction).                                                    |  |
+|  |   |   3.  **Data Read & Initial Processing:** |  |
+|  |   |       - Reads JSON files from `raw-json-data/` (using the selected batch `s3_key`s):                                                                                                     |  |
+|  |   |         `spark.read.option("mode", "PERMISSIVE").option("columnNameOfCorruptRecord", "_corrupt_record").json(input_s3_paths_list)`                                                      |  |
+|  |   |       - **Adds `source_s3_path` column:** `.withColumn("source_s3_path", input_file_name())`                                                                                            |  |
+|  |   |   4.  **Error Handling & Data Segregation:** |  |
+|  |   |       - Filters `_corrupt_record` to create `good_records_df` and `corrupt_records_df`.                                                                                                 |  |
+|  |   |       - If `corrupt_records_df` is not empty:                                                                                                                                             |  |
+|  |   |         - Writes `corrupt_records_df` to `s3://your-ml-data-lake-bucket/error-data-lake/json_malformed_records/` (Dead Letter Queue).                                                   |  |
+|  |   |         - Updates `file_processing_status` in RDS for these specific corrupt files: `SET processing_status = 'FAILED', error_message = 'Malformed JSON';` (Commits).                     |  |
+|  |   |   5.  **Transformation & Schema Management:** |  |
+|  |   |       - Applies transformations to `good_records_df` (e.g., flattening `DATE`, `MODE`, specific nested keys like `metadata.app_version`).                                               |  |
+|  |   |       - Explicitly casts critical columns (e.g., `event_timestamp` to `TimestampType`).                                                                                                 |  |
+|  |   |       - **Includes `col("*")` to infer and keep all other top-level keys.** |  |
+|  |   |       - Derives partition columns (`year`, `month`, `day`) from `event_time_utc`.                                                                                                       |  |
+|  |   |   6.  **Parquet Write:** |  |
+|  |   |       - Writes `transformed_df` to `s3://your-ml-data-lake-bucket/curated-data-lake/json_parsed_parquet/`                                                                                |  |
+|  |   |         `mode("append").partitionBy("year", "month", "day", "mode").option("mergeSchema", "True")`                                                                                      |  |
+|  |   |   7.  **S3 File Management (Post-Processing):** |  |
+|  |   |       - For each `s3_key` in `good_records_df`'s `source_s3_path`:                                                                                                                       |  |
+|  |   |         - **Copies** original raw JSON file from `raw-json-data/` to `raw-json-data-processed/` (maintaining original sub-folder structure, e.g., `all_historical_files/` or `YYYY/weekXX/`). |  |
+|  |   |         - **Deletes** original raw JSON file from `raw-json-data/`.                                                                                                                      |  |
+|  |   |         - Updates `file_processing_status` in RDS for this specific `s3_key`: `SET processing_status = 'SUCCEEDED', processed_at = NOW(), glue_job_run_id = <ID>;` (Commits).           |  |
+|  |   |         - If S3 move/delete fails, updates status to `FAILED` for that specific `s3_key` with an error message.                                                                         |  |
+|  |   |   8.  **Job Completion:** Logs success/failure for the overall batch. Handles uncaught exceptions by raising error to fail Glue Job.                                                      |  |
+|  |   +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|       |                                                                                                                                                                                             |
+|       |                                                                                                                                                                                             |
+|       v                                                                                                                                                                                             |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  |   Amazon RDS PostgreSQL (Relational Database) - `your-ml-data-db-instance`                                                                                                                  |  |
+|  |                                                                                                                                                                                               |  |
+|  |   - Database: `data_platform_db`                                                                                                                                                              |  |
+|  |   - Table: `file_processing_status` (Central Ledger for File Processing Status)                                                                                                               |  |
+|  |   - Stores: `s3_key`, `processing_status`, `glue_job_run_id`, `processed_at`, `error_message`, `retry_count`, etc.                                                                            |  |
+|  |   - Role: Ensures robust batch selection, fault tolerance (re-processes `FAILED` files), and provides audit trail.                                                                            |  |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|                                                                                                                                                                                                   |  |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  |   Amazon S3 (Simple Storage Service) - `your-ml-data-lake-bucket` (Continued)                                                                                                                 |  |
+|  |                                                                                                                                                                                               |  |
+|  |   +-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  |   | S3 Prefix: `raw-json-data-processed/`                                                                                                                                                   |  |
+|  |   |  - (Copies of Original Raw JSON files, after successful ETL)                                                                                                                              |  |
+|  |   |  - Role: Audit trail, source for re-processing or deep analysis if needed (not primary consumption).                                                                                      |  |
+|  |   |                                                                                                                                                                                           |  |
+|  |   |   +-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+ |
+|  |   |   | S3 Lifecycle Policy: `ProcessedRawDataArchival` (Applied to `raw-json-data-processed/`)                                                                                             | |
+|  |   |   |  - Action: Transition to `S3 Intelligent-Tiering`                                                                                                                                   | |
+|  |   |   |  - Rule: Transition objects to S3 Intelligent-Tiering (no days specified, or >0 if initially in S3 Standard for other reasons).                                                    | |
+|  |   |   |    (Intelligent-Tiering automatically moves to lower-cost tiers like IA, Archive Instant Access, Glacier Flexible Retrieval/Deep Archive based on access patterns after 30/90/180+ days) | |
+|  |   |   +-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+ |
+|  |   +-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  |                                                                                                                                                                                               |  |
+|  |   +-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  |   | S3 Prefix: `curated-data-lake/`                                                                                                                                                           |  |
+|  |   |  - `json_parsed_parquet/` (Optimized for ML Training & Analytics)                                                                                                                         |  |
+|  |   |    - `year=YYYY/month=MM/day=DD/mode=XYZ/` (Partitioned for efficient querying)                                                                                                              |  |
+|  |   |    - Contains `source_s3_path` column for lineage.                                                                                                                                        |  |
+|  |   |    - Schema: Union of all JSON key evolutions.                                                                                                                                            |  |
+|  |   +-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|       |                                                                                                                                                                                             |
+|       | 3. DATA CONSUMPTION FOR ML TRAINING & ANALYTICS                                                                                                                                           |
+|       v                                                                                                                                                                                             |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  |   AWS Analytics & Machine Learning Services                                                                                                                                                   |  |
+|  |                                                                                                                                                                                               |  |
+|  |   +---------------------------------------+                                                                                                                                                 |  |
+|  |   | AWS Glue Data Catalog                 |                                                                                                                                                 |  |
+|  |   |  - Managed metadata store for S3 data. |                                                                                                                                                 |  |
+|  |   |  - Automatically updated by Glue Jobs (`mergeSchema=True`).                                                                                                                               |  |
+|  |   |  - Provides schema for `json_parsed_parquet/` table to Athena/Spark.                                                                                                                      |  |
+|  |   +---------------------------------------+                                                                                                                                                 |  |
+|  |       |                                                                                                                                                                                       |  |
+|  |       +--------------------------------------------------+                                                                                                                                  |  |
+|  |       |                                                  |                                                                                                                                  |  |
+|  |       v                                                  v                                                                                                                                  |  |
+|  |   +---------------------------------------+      +------------------------------------------+                                                                                               |  |
+|  |   | Amazon Athena (Serverless SQL Query)  |      | Apache Spark (on AWS EMR / Glue Interactive Sessions) |                                                                                 |  |
+|  |   |  - Ad-hoc queries on Parquet.         |      |  - Distributed feature engineering.      |                                                                                               |  |
+|  |   |  - Data selection for ML training (using filters).                                                                                                                                          |  |
+|  |   |  - Uses partitions for cost/performance.                                                                                                                                                  |  |
+|  |   +---------------------------------------+      |  - Distributed DataFrame processing.     |                                                                                               |  |
+|  |                                                |  - Integration with PyTorch/TensorFlow (e.g., via Petastorm, Dask, Ray Data). |                                                             |  |
+|  |                                                +------------------------------------------+                                                                                               |  |
+|  |                                                                                                                                                                                               |  |
+|  |   +---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  |   | ML Training Applications (e.g., Amazon SageMaker Training Jobs, Custom EC2 Clusters with Dask/Ray)                                                                                   |  |
+|  |   |  - Reads large datasets in batches from `curated-data-lake/` (leveraging S3, Parquet, and partitioning).                                                                                |  |
+|  |   |  - Supports distributed training for models larger than single instance memory.                                                                                                         |  |
+|  |   |  - Performs periodic retraining on new incoming data.                                                                                                                                     |  |
+|  |   +---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|                                                                                                                                                                                                   |  |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|  |   AWS Management & Monitoring Services                                                                                                                                                        |  |
+|  |                                                                                                                                                                                               |  |
+|  |   +---------------------------------------+      +---------------------------------------+      +---------------------------------------+                                               |  |
+|  |   | Amazon CloudWatch                     |----->| Amazon SNS (Simple Notification Service)|----->| Email/Slack (Alerts)                  |                                               |  |
+|  |   |  - Logs (Glue, RDS)                   |      |  - For critical alerts (e.g., Glue job failures, DLQ activity, RDS issues).         |                                               |  |
+|  |   |  - Metrics (Glue DPU/runtime, RDS performance)                                                                                                                                              |  |
+|  |   |  - Alarms (on job failures, DLQ, RDS performance)                                                                                                                                         |  |
+|  |   +---------------------------------------+      +---------------------------------------+      +---------------------------------------+                                               |  |
+|  |                                                                                                                                                                                               |  |
+|  |   +---------------------------------------+                                                                                                                                                 |  |
+|  |   | AWS Identity and Access Management (IAM)                                                                                                                                                  |  |
+|  |   |  - Fine-grained access control for all AWS resources.                                                                                                                                     |  |
+|  |   |  - Specific roles for Glue Jobs (S3, RDS, Glue API).                                                                                                                                      |  |
+|  |   +---------------------------------------+                                                                                                                                                 |  |
+|  +-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+  |
+|                                                                                                                                                                                                   |  |
++-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
